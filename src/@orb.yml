@@ -1,0 +1,383 @@
+# Orb YAML Version
+version: 2.1
+
+# Orb Description
+description: |
+  CircleCI Orb to deploy your applications directly from the CircleCI Pipeline on Kapstan.
+  This orb mirrors the functionality of the corresponding Kapstan GitHub Action.
+
+# Optional: Display information in the CircleCI registry
+display:
+  home_url: "https://www.kapstan.io/" # Replace with actual homepage if different
+  source_url: "https://github.com/vikas-kapstan/deployment-orb" # Replace with your orb's source repository
+
+# Define reusable commands
+commands:
+  # Define the core deploy command
+  deploy:
+    description: Triggers and optionally waits for a Kapstan application deployment.
+    parameters:
+      # --- Input Parameters mirroring GitHub Action inputs ---
+      application_name:
+        description: "The name of the application on Kapstan."
+        type: string
+      image_tag:
+        description: "The primary image tag you want to deploy (optional)."
+        type: string
+        default: ""
+      # image_repository_name: # Note: This input existed in the action but wasn't used in the script.
+      #   description: "The image repository name (if needed by Kapstan API in the future)."
+      #   type: string
+      #   default: "" # Set default if needed
+      kapstan_api_key_var:
+        description: "Name of the environment variable storing your Kapstan API key (e.g., KAPSTAN_API_KEY)."
+        type: env_var_name
+        default: "KAPSTAN_API_KEY"
+      wait_for_deployment:
+        description: "Checks for deployment status and waits until success/failure is returned."
+        type: boolean
+        default: true
+      pre_deploy_image_tag:
+        description: "The image tag for a pre-deploy job (optional)."
+        type: string
+        default: ""
+      containers:
+        description: |
+          YAML/JSON string representing an array of container objects with 'name' and 'imageTag'.
+          Example: '[{"name": "web", "imageTag": "v1.1"}, {"name": "worker", "imageTag": "v1.1"}]'
+          Example YAML: |
+            - name: web
+              imageTag: v1.1
+            - name: worker
+              imageTag: v1.1
+        type: string
+        default: "[]" # Default to an empty JSON array string
+      # --- Polling Parameters (from script defaults) ---
+      max_attempts:
+        description: "Maximum attempts to check deployment status."
+        type: integer
+        default: 60
+      retry_wait_seconds:
+        description: "Seconds to wait between deployment status checks."
+        type: integer
+        default: 15 # Note: Script logic forces minimum 60s, we'll implement that below.
+
+    # --- Command Steps: The core logic from entrypoint.sh ---
+    steps:
+      - run:
+          name: Install Dependencies (jq, yq, curl)
+          # Assumes an environment with apt-get. Adjust if using Alpine (apk) or others.
+          # curl is usually pre-installed in cimg/* images.
+          command: |
+            sudo apt-get update && sudo apt-get install -y jq # Install jq
+            # Install yq (adjust version/method if needed)
+            sudo wget https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64 -O /usr/bin/yq && sudo chmod +x /usr/bin/yq
+            echo "Dependencies installed."
+      - run:
+          name: Deploy to Kapstan
+          # Use bash explicitly for better script compatibility
+          shell: /bin/bash
+          command: |
+            # --- Set parameters as environment variables for clarity ---
+            export INPUT_APPLICATION_NAME="<< parameters.application_name >>"
+            export INPUT_IMAGE_TAG="<< parameters.image_tag >>"
+            export INPUT_PRE_DEPLOY_IMAGE_TAG="<< parameters.pre_deploy_image_tag >>"
+            # Use indirect expansion to get the API key from the env var named by the parameter
+            if [ -z "${<< parameters.kapstan_api_key_var >>}" ]; then
+               echo "Error: Kapstan API Key environment variable (specified by kapstan_api_key_var: << parameters.kapstan_api_key_var >>) is not set or is empty."
+               # Add the actual value here for debugging (will be masked in logs) - REMOVE LATER
+               echo "Attempted to read value: '${!<< parameters.kapstan_api_key_var >>}'"
+               exit 1
+            fi
+            export INPUT_KAPSTAN_API_KEY="${<< parameters.kapstan_api_key_var >>}"
+            export INPUT_WAIT_FOR_DEPLOYMENT="<< parameters.wait_for_deployment >>"
+            export INPUT_CONTAINERS_YAML='<< parameters.containers >>' # Keep single quotes to preserve structure
+            export PARAM_MAX_ATTEMPTS="<< parameters.max_attempts >>"
+            export PARAM_RETRY_WAIT_SECONDS="<< parameters.retry_wait_seconds >>"
+
+            # --- Validate API Key ---
+            if [ -z "$INPUT_KAPSTAN_API_KEY" ]; then
+              echo "Error: Kapstan API Key environment variable (specified by kapstan_api_key_var: << parameters.kapstan_api_key_var >>) is not set."
+              exit 1
+            fi
+
+            # --- Define variables based on CircleCI environment ---
+            # Use CIRCLE_TAG if available, otherwise CIRCLE_BRANCH
+            export CIRCLE_REF_NAME="${CIRCLE_TAG:-$CIRCLE_BRANCH}"
+            export COMMIT_DETAILS="https://github.com/${CIRCLE_PROJECT_USERNAME}/${CIRCLE_PROJECT_REPONAME}/commit/${CIRCLE_SHA1}"
+            export kapstan_api_base_url="https://api.kapstan.io/v2/external"
+            export filePath="/tmp/kapstan_response_$CIRCLE_WORKFLOW_ID_$CIRCLE_BUILD_NUM.txt" # Make temp file unique per job
+
+            # --- Ensure yq Input Parameter is Valid ---
+            # Try converting the input container YAML/JSON string to JSON
+            echo "Input Containers YAML/JSON String:"
+            echo "${INPUT_CONTAINERS_YAML}"
+            INPUT_CONTAINERS_JSON=$(echo "${INPUT_CONTAINERS_YAML}" | yq eval -o=json)
+            if [ $? -ne 0 ]; then
+                echo "Error: Failed to parse 'containers' parameter as valid YAML/JSON."
+                echo "Please provide a valid YAML or JSON string."
+                echo "Example YAML: '[{name: web, imageTag: v1.1}]'"
+                echo "Example JSON: '[{\"name\": \"web\", \"imageTag\": \"v1.1\"}]'"
+                exit 1
+            fi
+            # Handle empty/null input explicitly if needed, yq might output 'null'
+            if [ "$INPUT_CONTAINERS_JSON" == "null" ]; then
+              INPUT_CONTAINERS_JSON="[]"
+            fi
+            echo "Parsed Containers JSON: $INPUT_CONTAINERS_JSON"
+
+
+            # --- Function to trigger application deployment ---
+            deployment_application() {
+              local deployment_trigger_url="$kapstan_api_base_url/applications/${INPUT_APPLICATION_NAME}/deploy"
+              local request_body
+
+              # Build the JSON request body - Use jq for safety if complex inputs arise
+              request_body=$(jq -n \
+                --arg imageTag "$INPUT_IMAGE_TAG" \
+                --arg comment "Deployment triggered by CircleCI job $CIRCLE_JOB on $CIRCLE_REF_NAME in $CIRCLE_PROJECT_USERNAME/$CIRCLE_PROJECT_REPONAME" \
+                --arg preDeployImageTag "$INPUT_PRE_DEPLOY_IMAGE_TAG" \
+                --argjson containersUpdate "$INPUT_CONTAINERS_JSON" \
+                --arg commitDetails "$COMMIT_DETAILS" \
+                '{imageTag: $imageTag, comment: $comment, preDeployImageTag: $preDeployImageTag, containersUpdate: $containersUpdate, commitDetails: $commitDetails}')
+
+              echo "Triggering Deployment..."
+              echo "API URL: $deployment_trigger_url"
+              echo "Request Body: $request_body"
+
+              STATUS_CODE=$(curl -sSk -o "$filePath" -w "%{http_code}" -X POST "$deployment_trigger_url" \
+                -H "Content-Type: application/json" \
+                -H "x-api-key: $INPUT_KAPSTAN_API_KEY" \
+                -d "$request_body")
+
+              echo "Response Body:"
+              cat "$filePath" || echo "{}" # Show empty object if file is empty/doesn't exist
+              echo # Newline for clarity
+              echo "Response Status Code: $STATUS_CODE"
+
+              if [[ $STATUS_CODE != 2* ]]; then
+                echo "ERROR: Failed to trigger deployment. API returned status $STATUS_CODE."
+                echo "Error details: $(cat $filePath || echo 'No response body')"
+                rm -f "$filePath" # Clean up temp file
+                exit 1
+              fi
+
+              # Extract Deployment ID safely using jq
+              DEPLOYMENT_ID=$(jq -r '.deployment_id // empty' "$filePath")
+              if [ -z "$DEPLOYMENT_ID" ]; then
+                 echo "ERROR: Could not extract deployment_id from response."
+                 cat "$filePath"
+                 rm -f "$filePath"
+                 exit 1
+              fi
+
+              echo "Deployment triggered successfully. Deployment ID: $DEPLOYMENT_ID"
+              # Export for subsequent steps within the same job
+              echo "export KAPSTAN_DEPLOYMENT_ID='$DEPLOYMENT_ID'" >> $BASH_ENV
+              rm -f "$filePath" # Clean up temp file
+            }
+
+            # --- Function to get deployment status ---
+            get_deployment_status(){
+              local deployment_status_url="$kapstan_api_base_url/applications/${INPUT_APPLICATION_NAME}/deployments/${KAPSTAN_DEPLOYMENT_ID}" # Use exported variable
+              echo "Checking deployment status..."
+              echo "API URL: $deployment_status_url"
+              local status_code
+              status_code=$(curl -sSk -o "$filePath" -w "%{http_code}" "$deployment_status_url" \
+                -H "Content-Type: application/json" \
+                -H "x-api-key: $INPUT_KAPSTAN_API_KEY")
+
+              local response_body
+              response_body=$(cat "$filePath" || echo '{}')
+              echo "Status Check Response Status Code: $status_code"
+              # echo "Status Check Response Body: $response_body" # Can be verbose, enable if debugging
+
+              if [[ $status_code != 2* ]]; then
+                 echo "WARNING: Failed to get deployment status (HTTP $status_code). Response: $response_body"
+                 DEPLOYMENT_STATUS="UNKNOWN" # Set a default status on error
+              else
+                DEPLOYMENT_STATUS=$(jq -r '.stage // "UNKNOWN"' "$filePath") # Use jq, default to UNKNOWN
+              fi
+
+              echo "Current Deployment Status: $DEPLOYMENT_STATUS"
+              # Export for subsequent steps within the same job
+              echo "export KAPSTAN_DEPLOYMENT_STATUS='$DEPLOYMENT_STATUS'" >> $BASH_ENV
+              rm -f "$filePath" # Clean up temp file
+            }
+
+            # --- Function to check deployment status with retries ---
+            check_deployment_status(){
+              # Apply original script's logic for min/max values
+              local MAX_ATTEMPTS=$PARAM_MAX_ATTEMPTS
+              local RETRY_WAIT_SECONDS=$PARAM_RETRY_WAIT_SECONDS
+              local MIN_RETRY_WAIT_SECONDS=60
+              local MAX_ATTEMPTS_UPPER_THRESHOLD=120
+
+              (( RETRY_WAIT_SECONDS < MIN_RETRY_WAIT_SECONDS )) && RETRY_WAIT_SECONDS=$MIN_RETRY_WAIT_SECONDS
+              (( MAX_ATTEMPTS > MAX_ATTEMPTS_UPPER_THRESHOLD )) && MAX_ATTEMPTS=$MAX_ATTEMPTS_UPPER_THRESHOLD
+
+              echo "Waiting for deployment completion (Max Attempts: $MAX_ATTEMPTS, Wait Interval: $RETRY_WAIT_SECONDS s)"
+
+              for ((attempt=1; attempt<=MAX_ATTEMPTS; attempt++)); do
+                echo "Attempt $attempt/$MAX_ATTEMPTS..."
+                get_deployment_status # This function now exports KAPSTAN_DEPLOYMENT_STATUS
+
+                # Use the value exported by get_deployment_status
+                if [[ "$KAPSTAN_DEPLOYMENT_STATUS" == "STAGE_COMPLETED" ]]; then
+                    echo "Deployment completed successfully for application: $INPUT_APPLICATION_NAME"
+                    echo "export KAPSTAN_DEPLOYMENT_MESSAGE='Deployment completed for application: $INPUT_APPLICATION_NAME'" >> "$BASH_ENV"
+                    return 0 # Success
+                elif [[ "$KAPSTAN_DEPLOYMENT_STATUS" == "STAGE_FAILED" ]]; then
+                    echo "ERROR: Deployment failed."
+                    echo "export KAPSTAN_DEPLOYMENT_MESSAGE='Deployment failed'" >> "$BASH_ENV"
+                    return 1 # Failure
+                elif [[ "$attempt" == "$MAX_ATTEMPTS" ]]; then
+                    echo "ERROR: Failed to get definitive deployment status after $MAX_ATTEMPTS attempts."
+                    echo "Last known status: $KAPSTAN_DEPLOYMENT_STATUS"
+                    echo "export KAPSTAN_DEPLOYMENT_MESSAGE='Failed to get deployment status, exiting after max attempts reached, last known status: $KAPSTAN_DEPLOYMENT_STATUS'" >> "$BASH_ENV"
+                    return 1 # Failure (Timeout)
+                else
+                    echo "Deployment status is '$KAPSTAN_DEPLOYMENT_STATUS'. Waiting for $RETRY_WAIT_SECONDS seconds before next check."
+                    sleep "$RETRY_WAIT_SECONDS"
+                fi
+              done
+            }
+
+            # --- Main execution flow ---
+            deployment_application # Trigger deployment, exports KAPSTAN_DEPLOYMENT_ID
+
+            # Only check status if KAPSTAN_DEPLOYMENT_ID was set and wait is enabled
+            if [[ "$INPUT_WAIT_FOR_DEPLOYMENT" == "true" ]] && [ -n "$KAPSTAN_DEPLOYMENT_ID" ]; then
+              if ! check_deployment_status; then # If check_deployment_status returns non-zero (failure)
+                  exit 1 # Fail the CircleCI step
+              fi
+            elif [ -z "$KAPSTAN_DEPLOYMENT_ID" ]; then
+                 echo "Skipping status check because Deployment ID could not be obtained."
+                 # Do not exit 1 here, the failure happened in deployment_application
+            else
+              echo "Deployment triggered. Status check waiting is disabled (wait_for_deployment: false)."
+            fi
+
+            echo "Kapstan deploy command finished."
+            # Variables KAPSTAN_DEPLOYMENT_ID, KAPSTAN_DEPLOYMENT_STATUS, KAPSTAN_DEPLOYMENT_MESSAGE
+            # are now available in $BASH_ENV for subsequent steps in this job.
+
+# Define reusable executors (optional but recommended)
+executors:
+  default:
+    description: "A basic Docker container with Ubuntu, suitable for running the deploy command."
+    docker:
+      # You can specify tags, e.g., cimg/base:2023.08
+      - image: cimg/base:stable # Includes curl, git, bash. We install jq, yq.
+
+# Define reusable jobs (optional - users can call the command directly)
+jobs:
+  deploy-to-kapstan:
+    description: "Example job demonstrating the Kapstan deployment."
+    executor: default # Use the executor defined above
+    parameters:
+      # Pass through parameters needed by the 'deploy' command
+      application_name:
+        description: "The name of the application on Kapstan."
+        type: string
+      image_tag:
+        description: "The primary image tag you want to deploy (optional)."
+        type: string
+        default: ""
+      kapstan_api_key_var:
+        description: "Name of the environment variable storing your Kapstan API key."
+        type: env_var_name
+        default: "KAPSTAN_API_KEY"
+      wait_for_deployment:
+        description: "Wait for deployment success/failure."
+        type: boolean
+        default: true
+      pre_deploy_image_tag:
+        description: "The image tag for a pre-deploy job (optional)."
+        type: string
+        default: ""
+      containers:
+        description: "YAML/JSON string for container updates."
+        type: string
+        default: "[]"
+      max_attempts:
+        description: "Maximum attempts to check deployment status."
+        type: integer
+        default: 60
+      retry_wait_seconds:
+        description: "Seconds to wait between deployment status checks."
+        type: integer
+        default: 15
+    steps:
+      # Checkout code if needed (e.g., to read version files), though not strictly required by the deploy command itself
+      # - checkout
+      # Call the deploy command, passing job parameters to command parameters
+      - deploy:
+          application_name: << parameters.application_name >>
+          image_tag: << parameters.image_tag >>
+          kapstan_api_key_var: << parameters.kapstan_api_key_var >>
+          wait_for_deployment: << parameters.wait_for_deployment >>
+          pre_deploy_image_tag: << parameters.pre_deploy_image_tag >>
+          containers: << parameters.containers >>
+          max_attempts: << parameters.max_attempts >>
+          retry_wait_seconds: << parameters.retry_wait_seconds >>
+      # Example: Accessing the exported variables in a subsequent step within the same job
+      - run:
+          name: Show Deployment Output Variables
+          command: |
+            echo "Deployment ID: $KAPSTAN_DEPLOYMENT_ID"
+            echo "Final Deployment Status: $KAPSTAN_DEPLOYMENT_STATUS"
+            echo "Deployment Message: $KAPSTAN_DEPLOYMENT_MESSAGE"
+          # Only run if deployment was triggered and waited for
+          when: << parameters.wait_for_deployment >>
+
+# Example usage in a project's .circleci/config.yml
+examples:
+  simple_deploy:
+    description: "Trigger a deployment and wait for completion."
+    usage:
+      version: 2.1
+      orbs:
+        # Replace with your namespace and orb name once published
+        kapstan: your-namespace/kapstan-orb@1.2.3
+      workflows:
+        deploy_app:
+          jobs:
+            # Option 1: Using the pre-defined job (if you included one)
+            - kapstan/deploy-to-kapstan:
+                application_name: "my-web-app"
+                image_tag: "v1.5.0" # Or use $CIRCLE_TAG, $CIRCLE_SHA1 etc.
+                # Ensure KAPSTAN_API_KEY is set in CircleCI Project Settings or Contexts
+                # kapstan_api_key_var: "KAPSTAN_API_KEY" # Default is usually fine
+                # wait_for_deployment: true # Default
+                # pre_deploy_image_tag: "pre-v1.5.0" # Optional
+                # containers: '[{"name": "nginx", "imageTag": "latest"}]' # Optional JSON string
+                containers: | # Optional YAML string
+                  - name: frontend
+                    imageTag: v1.5.0
+                  - name: backend
+                    imageTag: v1.5.0
+
+            # Option 2: Using the command directly within your own job
+            - build_and_deploy: # Your custom job name
+                jobs:
+                  - my_build_job: # Hypothetical build job
+                      # ... build steps ...
+                      # Persist tag to workspace if needed
+
+                  - deploy_job: # Your custom deploy job
+                      # Requires the build job if tag comes from there
+                      # requires:
+                      #   - my_build_job
+                      executor: kapstan/default # Use the orb's executor
+                      steps:
+                        # - attach_workspace: # Get tag from workspace if needed
+                        #     at: /tmp/workspace
+                        # - run: export APP_IMAGE_TAG=$(cat /tmp/workspace/image_tag.txt) >> $BASH_ENV
+                        - kapstan/deploy: # Call the command directly
+                            application_name: "my-worker-app"
+                            image_tag: "sha-${CIRCLE_SHA1:0:7}" # Example: using commit SHA short hash
+                            # Ensure KAPSTAN_API_KEY is set in CircleCI Project Settings or Contexts
+                            wait_for_deployment: false # Example: Don't wait
+                        # Subsequent steps in this job can use $KAPSTAN_DEPLOYMENT_ID etc.
+                        - run: echo "Triggered Kapstan Deployment ID $KAPSTAN_DEPLOYMENT_ID"
