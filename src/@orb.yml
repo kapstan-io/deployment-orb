@@ -135,7 +135,7 @@ commands:
               # Build the JSON request body - Use jq for safety if complex inputs arise
               request_body=$(jq -n \
                 --arg imageTag "$INPUT_IMAGE_TAG" \
-                --arg comment "Deployment triggered by CircleCI job $CIRCLE_JOB on $CIRCLE_REF_NAME in $CIRCLE_PROJECT_USERNAME/$CIRCLE_PROJECT_REPONAME" \
+                --arg comment "Deployment triggered by $CIRCLE_JOB on $CIRCLE_REF_NAME in $CIRCLE_PROJECT_USERNAME/$CIRCLE_PROJECT_REPONAME" \
                 --arg preDeployImageTag "$INPUT_PRE_DEPLOY_IMAGE_TAG" \
                 --argjson containersUpdate "$INPUT_CONTAINERS_JSON" \
                 --arg commitDetails "$COMMIT_DETAILS" \
